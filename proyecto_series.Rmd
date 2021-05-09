@@ -1,0 +1,570 @@
+---
+title: "Proyecto final de series de tiempo"
+author: "Rodrigo Leo"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+Este documento contiene el código de `R` empleado para la elaboración del proyecto final de series de tiempo.
+
+## 1. Importar y analizar datos
+
+Los datos corresponden a la serie del índice accionario Standard and Poor's 500, y se obtuvieron del símbolo `GSPC` de acuerdo a la información histórica disponible en https://finance.yahoo.com/quote/%5EGSPC. Se empleó el precio ajustado de cierre del índice del 3 de enero de 2020 al 20 de abril de 2021.
+
+Cargar las librerías requeridas:
+
+```{r message=FALSE}
+library("readxl")
+library("xts")
+library("tseries")
+library("forecast")
+library("rugarch")
+library("vars")
+library("PerformanceAnalytics")
+library("DMwR")
+```
+
+Importar datosy revisar datos:
+
+```{r}
+datos <- read_excel("gspc.xlsx")
+summary(datos)
+```
+ 
+Crear el objeto `sp500` como una serie de tiempo (un objeto de la clase `xts`):
+
+```{r}
+sp500 <- xts(x = datos$close, order.by = datos$date)
+```
+
+Verificar que la periodicidad de la serie sea correcta (se esperan datos diarios de 20 años):
+
+```{r}
+periodicity(sp500)
+```
+
+Efectivamente, la serie de tiempo es de periodicidad diaria, con datos del 3 de enero de 2020 al 20 de abril de 2021.
+
+Se grafica la serie de tiempo para una primera inspección visual:
+
+```{r}
+plot(sp500)
+```
+
+Se prueba estacionariedad con la prueba aumentada de Dickey-Fuller:
+
+```{r}
+adf.test(sp500, alternative = 's')
+```
+
+El valor $p$ cercano a uno indica que no se puede rechazar la hipótesis nula de que la serie presenta raíz unitaria.
+
+Se calcula una serie que contiene las primeras diferencias para verificar si el proceso es integrado de orden uno. Esta serie se denomina `sp500_1`:
+
+```{r}
+sp500_1 <- log(sp500) - log(lag(sp500))
+sp500_1 <- na.omit(sp500_1)
+```
+
+Verificar periodicidad de la serie de primeras diferencias:
+
+```{r}
+periodicity(sp500_1)
+```
+
+Se tiene una observación menos debido al cálculo de primeras diferencias.
+
+Se repite la prueba aumentada de Dickey-Fuller con la serie de primeras diferencias:
+
+```{r}
+adf.test(sp500_1, alternative = 's')
+```
+
+El valor $p$ menor a 0.01 indica que se rechaza la hipótesis nula de que la serie `sp500_1` tiene raíz unitaria. Como esta serie contiene las primeras diferencias de `sp500`, entonces esta última es una serie integrada de orden 1.
+
+Gráfica de la serie de primeras diferencias:
+
+```{r}
+plot(sp500_1)
+```
+
+Autocorrelación de la serie `sp500`:
+
+```{r}
+sp500_acf <- acf(sp500)
+```
+
+Autocorrelación parcial de la serie `sp500`:
+
+```{r}
+sp500_pacf <- pacf(sp500)
+```
+
+Autocorrelación de la serie `sp500_1`:
+
+```{r}
+sp500_1_acf <- acf(sp500_1)
+```
+
+Autocorrelación parcial de la serie `sp500_1`:
+
+```{r}
+sp500_1_pacf <- pacf(sp500_1)
+```
+
+Se realiza la prueba de Ljung-Box para deterninar si existe correlación serial en la serie estacionaria (`sp500_1`), para órdenes desde 1 hasta 30:
+
+```{r}
+for (i in 1:30) {
+  prueba = Box.test(sp500_1, lag = i, type = "Ljung")
+  cat(i, "\t", round(prueba$statistic, 1), "\t", prueba$p.value, "\n")
+}
+```
+
+Los valores $p$ iguales a cero indican que se rechaza la hipótesis nula de que las observaciones no tienen correlación serial para órdenes menores o iguales a 30.
+
+
+## 2. Modelo ARMA
+
+De acuerdo a la [documentación del comando `ARMA`](https://www.rdocumentation.org/packages/tseries/versions/0.10-48/topics/arma), la especificación del modelo ARMA($p$, $q$) en `R` es
+
+$$ y_t = a_0 + a_1 y_{t-1} + \cdots + a_p y_{t-p} + b_1 e_{t-1} + \cdots + b_q e_{t-q} + e_t$$
+
+Los comandos para los criterios de información en `R` sólo funcionan para estimaciones hechas mediante máxima verosimilitud (MLE), y la implementación del comando `arma` sólo es capaz de estimar usando mínimos cuadrados ordinarios (OLS). El comando que emplea MLE es `Arima`, por lo que es el que se utilizará para ajustar los modelos y obtener criterios de información. Dado que se empleará la serie `sp500_1` (que tiene removida la raíz unitaria presente en la serie original), el orden de integración del modelo debe ser cero (ARIMA($p$, $0$, $q$)), lo cual equivale a un modelo ARMA($p$, $q$).
+
+Como primer ejercicio se estima el modelo ARMA(1, 1):
+
+```{r}
+arima_1_0_1 <- Arima(sp500_1, order = c(1, 0, 1))
+print(arima_1_0_1)
+```
+
+Para determinar el mejor modelo empleando el criterio de información de Akaike (AIC), se estman 100 modelos ARMA($p$, $q$) diferentes, donde los parámetros de orden $p$ y $q$ varían independientemente en el rango de 1 hasta 10. Para cada modelo se obtiene el criterio de Akaike, y éstos se almacenan en la matriz `criterios_aic`, donde el número de fila corresponde al orden $p$ y el número de columna corresponde al orden $q$:
+
+```{r}
+criterios_aic <- matrix(nrow = 10, ncol = 10)
+
+for (p in 1:10) {
+  for (q in 1:10) {
+    modelo <- Arima(sp500_1, order = c(p, 0, q))
+    criterios_aic[p,q] <- modelo$aic
+  }
+}
+```
+
+La matriz `criterios_aic` resulta ser:
+
+```{r}
+print(criterios_aic)
+```
+
+El valor mínimo es:
+
+```{r}
+print(min(criterios_aic))
+```
+
+Que corresponde a la siguiente entrada:
+
+```{r}
+which(criterios_aic == min(criterios_aic), arr.ind = TRUE)
+```
+
+Por lo tanto, el modelo óptimo es el ARMA(9, 9). Se ajusta dicho modelo a los datos:
+
+```{r}
+arima_9_0_9 <- Arima(sp500_1, order = c(9, 0, 9))
+print(arima_9_0_9)
+```
+
+```{r}
+residuales <- checkresiduals(arima_9_0_9)
+```
+
+Valor $p$ de la prueba de Ljung-Box sobre los residuales del modelo ajustado:
+
+```{r}
+print(residuales$p.value)
+```
+
+Debido a las que presenta la serie con periodicidad diaria, se convierte a datos mensuales empleando el valor de cierre (del último día del mes) como valor mensual. Esta nueva serie se denomina `sp500m`:
+
+```{r}
+sp500m <- to.monthly(sp500)
+sp500m <- sp500m$sp500.Close
+```
+
+Gráfica de la serie mensual:
+
+```{r}
+plot(sp500m)
+```
+
+Prueba de Dickey-Fuller aumentada:
+
+```{r}
+adf.test(sp500m, alternative = 's')
+```
+
+No se puede rechazar la hipótesis nula de que la serie tiene raíz unitaria. Se obtiene la serie `sp500m_1` que contiene las primeras diferencias:
+
+```{r}
+sp500m_1 <- log(sp500m) - log(lag(sp500m))
+sp500m_1 <- na.omit(sp500m_1)
+```
+
+Gráfica de `sp500m_1`:
+
+```{r}
+plot(sp500m_1)
+```
+
+Prueba de DIckey-Fuller aumentada para `sp500m_1`:
+
+```{r}
+adf.test(sp500m_1)
+```
+
+Se rechaza la hipótesis nula de que la serie `sp500m_1` tiene raíz unitaria.
+
+Función de autocorrelación de `sp500m_1`:
+
+```{r}
+sp500m_1_acf <- acf(sp500m_1)
+```
+
+Función de autocorrelación parcial de `sp500m_1`:
+
+```{r}
+sp500m_1_pacf <- pacf(sp500m_1)
+```
+
+Prueba de Ljung-Box para determinar si existe autocorrelación serial:
+
+```{r}
+for (i in 1:30) {
+  prueba = Box.test(sp500m_1, lag = i, type = "Ljung")
+  cat(i, "\t", round(prueba$statistic, 1), "\t", prueba$p.value, "\n")
+}
+```
+
+Se repite la búsqueda del modelo ARMA óptimo para la nueva serie `sp500m_1`, esta vez variando los parámetros $p$ y $q$ entre 1 y 10:
+
+```{r}
+criterios_aic_m <- matrix(nrow = 10, ncol = 10)
+
+for (p in 1:10) {
+  for (q in 1:10) {
+    modelo <- Arima(sp500m_1, order = c(p, 0, q), method = 'ML')
+    criterios_aic_m[p,q] <- modelo$aic
+  }
+}
+```
+
+La matriz `criterios_aic_m` resulta ser:
+
+```{r}
+print(criterios_aic_m)
+```
+
+El valor mínimo es:
+
+```{r}
+print(min(criterios_aic_m))
+```
+
+Que corresponde a la siguiente entrada:
+
+```{r}
+which(criterios_aic_m == min(criterios_aic_m), arr.ind = TRUE)
+```
+
+Por lo tanto, el modelo óptimo es el ARMA(1, 1). Se ajusta dicho modelo a los datos:
+
+```{r}
+arima_m_1_0_1 <- Arima(sp500m_1, order = c(1, 0, 1))
+print(arima_m_1_0_1)
+```
+
+Residuales:
+
+```{r}
+residuales_m <- checkresiduals(arima_m_1_0_1)
+```
+
+Valor $p$ de la prueba de Ljung-Box sobre los residuales del modelo ajustado:
+
+```{r}
+print(residuales_m$p.value)
+```
+
+Por tanto los residuales parecen ser ruido blanco.
+
+Pronóstico dentro de la muestra:
+
+```{r}
+training_set <- sp500m_1['/2018-12-31']
+evaluation_set <- sp500m_1['2019-01-01/']
+
+training_model <- Arima(training_set, order = c(1, 0, 1))
+
+pronostico <- xts(predict(training_model, length(evaluation_set))$pred, order.by = index(evaluation_set))
+pronostico_in <- merge(pronostico, evaluation_set, join='inner')
+
+plot.xts(pronostico_in, screens = factor(1, 1),  legend.loc = 'bottomright')
+```
+
+Medidas de error del pronóstico dentro de la muestra:
+
+```{r}
+medidas_error = regr.eval(coredata(evaluation_set), coredata(predict(training_model, length(evaluation_set))$pred))
+print(round(medidas_error, 4))
+```
+
+Pronóstico fuera de la muestra:
+
+```{r}
+pronostico <- xts(predict(training_model, 12)$pred, order.by = seq(as.Date("2021-06-01"),length=12,by="months"))
+pronostico_out <- merge(pronostico, sp500_1, join = 'outer', fill = 0)['2021-01-01/']
+
+plot.xts(pronostico_out, screens = factor(1, 1),  legend.loc = 'bottomright')
+```
+
+
+## Modelo de volatilidad GARCH
+
+Se estiman 25 modelos GARCH diferentes variando los parámetros $p$ y $q$ entre 1 y 5. Para cada modelo se calcula el criterio de información bayesiano (BIC) y éstos se almacenan en la matriz `criterios_bic`, donde el número de fila corresponde al orden de $p$ y el número de columna corresponde al orden de $q$:
+
+```{r}
+
+criterios_bic = matrix(nrow = 5, ncol= 5)
+
+for (p in 1:5) {
+  for (q in 1:5) {
+    # Especificación del modelo:
+    garch_spec <- ugarchspec(
+      variance.model = list(
+        model = "sGARCH",
+        garchOrder = c(p, q)),
+      mean.model = list(
+        armaOrder = c(p, q)),
+      distribution.model = "norm")
+    # Ajuste del modelo:
+    garch_model <- ugarchfit(spec = garch_spec, data = sp500_1)
+    # Cálculo del BIC:
+    criterios_bic[p, q] = infocriteria(garch_model)[2]
+  }
+}
+```
+
+Matriz de criterios BIC:
+
+```{r}
+criterios_bic
+```
+
+El valor mínimo es:
+
+```{r}
+print(min(criterios_bic))
+```
+
+Que corresponde a la siguiente entrada:
+
+```{r}
+which(criterios_bic == min(criterios_bic), arr.ind = TRUE)
+```
+
+Por lo que el modelo óptimo es el GARCH(2, 1). Este modelo se ajusta en el objeto `garch_2_1`:
+
+```{r}
+garch_spec <- ugarchspec(
+  variance.model = list(
+    model = "sGARCH",
+    garchOrder = c(2, 1)),
+  mean.model = list(
+    armaOrder = c(2, 1)),
+  distribution.model = "norm")
+
+garch_2_1 <- ugarchfit(spec = garch_spec, data = sp500_1)
+```
+
+Resultado del ajuste:
+
+```{r}
+show(garch_2_1)
+```
+
+Se observa que todos los coeficientes son significativos.
+
+Se analiza qué sucede al aumentar el número de parámetros a $p=3$ y $q=2$:
+
+```{r}
+garch_spec <- ugarchspec(
+  variance.model = list(
+    model = "sGARCH",
+    garchOrder = c(3, 2)),
+  mean.model = list(
+    armaOrder = c(3, 2)),
+  distribution.model = "norm")
+
+garch_3_2 <- ugarchfit(spec = garch_spec, data = sp500_1)
+
+show(garch_3_2)
+```
+
+Normalidad de los residuales:
+
+```{r}
+plot(garch_2_1, which = 9)
+```
+
+Los residuales no parecen seguir una distribución normal.
+
+Autocorrelación de los residuales:
+
+```{r}
+plot(garch_2_1, which = 10)
+```
+
+Gráfico de la volatilidad con 2 desviaciones estándar:
+
+```{r}
+plot(garch_2_1, which = 1)
+```
+
+El valor en riesgo de la serie es (para $p$ igual a 0.90, 0.95 y 0.99):
+
+```{r}
+for (prob in c(0.90, 0.95, 0.99)) {
+  print(c(prob, VaR(sp500_1, p = prob, method = 'historical')))
+}
+```
+
+
+```{r}
+for (prob in c(0.10, 0.05, 0.01)) {
+  print(c(prob, -quantile(sp500_1, prob) * 100))
+}
+```
+
+
+## Modelo de vectores autorregresivos
+
+Serie del retorno de largo plazo del Tesoro de EUA (compuesto a 10 años): https://www.treasury.gov/resource-center/data-chart-center/interest-rates/pages/TextView.aspx?data=longtermrateAll
+
+
+Importar datos y revisar datos:
+
+```{r}
+datos_ltc <- read_excel("lt_composite.xlsx")
+summary(datos_ltc)
+```
+
+Crear el objeto `ltc` como una serie de tiempo (un objeto de la clase `xts`):
+
+```{r}
+ltc <- xts(x = datos_ltc$lt_composite, order.by = datos_ltc$date)
+```
+
+Verificar que la periodicidad de la serie sea correcta (se esperan datos diarios de 20 años):
+
+```{r}
+periodicity(ltc)
+```
+
+Gráfica de la serie de tiempo:
+
+```{r}
+plot(ltc)
+```
+
+Se prueba estacionariedad con la prueba ADF:
+
+```{r}
+adf.test(ltc, alternative = 's')
+```
+
+El valor $p$ de 0.01 indica que se rechaza la hipótesis nula de que la serie presenta raíz unitaria. Aun así, para que esta serie sea consistente con la `sp500_1`, se laculan las primeras diferencias en una nueva serie `ltc_1`:
+
+```{r}
+ltc_1 <- ltc - lag(ltc)
+ltc_1 <- na.omit(ltc_1)
+```
+
+Verificar periodicidad de la serie de primeras diferencias:
+
+```{r}
+periodicity(ltc_1)
+```
+
+Se tiene una observación menos debido al cálculo de primeras diferencias.
+
+Se repite la prueba aumentada de Dickey-Fuller con la serie de primeras diferencias:
+
+```{r}
+adf.test(ltc_1)
+```
+
+La serie conserva su estacionariedad original.
+
+Gráfico de la serie de primeras diferencias:
+
+```{r}
+plot(ltc_1)
+```
+
+Se encuentra el inicio y el final comunes de ambas series:
+
+```{r}
+inicio <- max(min(index(sp500_1)), min(index(ltc_1)))
+final <- min(max(index(sp500_1)), max(index(ltc_1)))
+```
+
+Estas fechas son, respectivamente:
+
+```{r}
+print(c(inicio, final))
+```
+
+```{r}
+res <- merge(sp500, ltc, join='inner')
+plot(res)
+```
+
+```{r}
+VARselect(res)
+```
+
+```{r}
+var_10 <- VAR(res, p = 10, type = 'const')
+```
+
+```{r}
+summary(var_10)
+```
+
+```{r}
+plot(var_10)
+```
+
+```{r}
+arch(var_10)
+```
+
+```{r}
+ir <- irf(var_10, seed = 1)
+plot(ir)
+```
+
+```{r}
+ir$runs
+```
+
+```{r}
+ir$irf
+```
+
